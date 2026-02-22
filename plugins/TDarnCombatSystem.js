@@ -336,50 +336,40 @@ Game_Battler.prototype.makeSpeed = function() {
 // BattleManager Initiative Override
 //=============================================================================
 
+// Module-level guard so re-entrancy protection works regardless of `this` context.
+// YEP_X_TurnOrderDisplay hooks Game_Action.clear() → calls makeActionOrders every
+// time a new Game_Action is created. makeActions() creates Game_Actions, so without
+// this guard we get: makeActions → new Game_Action → clear → makeActionOrders →
+// makeActions → ... infinite loop. The guard makes re-entrant calls no-ops.
+// makeActions() is intentionally NOT called here — it lives in startInput so that
+// Yanfly's legitimate calls to makeActionOrders (for display refresh) don't
+// re-allocate action slots and wipe actors' chosen actions mid-turn.
+var _TDarn_makingActionOrders = false;
+
 BattleManager.makeActionOrders = function() {
-    console.log('makeActionOrders called (custom initiative version)');
+    if (_TDarn_makingActionOrders) return;
+    _TDarn_makingActionOrders = true;
 
-    // Allocate action slots. Without this _actions is empty and canInput() is
-    // always false, so selectNextCommand skips all actors immediately.
-    $gameParty.makeActions();
-    $gameTroop.makeActions();
+    var combatants = [];
+    $gameParty.aliveMembers().forEach(function(m) { combatants.push(m); });
+    $gameTroop.aliveMembers().forEach(function(m) { combatants.push(m); });
 
-    const combatants = [];
-    
-    $gameParty.aliveMembers().forEach(m => {
-        console.log('Adding party member:', m.name());
-        combatants.push(m);
-    });
-    
-    $gameTroop.aliveMembers().forEach(m => {
-        console.log('Adding enemy:', m.name());
-        combatants.push(m);
-    });
-    
-    console.log('Total combatants:', combatants.length);
-    
-    if (combatants.length === 0) {
-        console.log('WARNING: No combatants found!');
+    if (combatants.length > 0) {
+        combatants.forEach(function(battler) {
+            // Only re-roll initiative if not already set this turn
+            if (battler._initiative === undefined || battler._initiative === null) {
+                battler._initiative = Math.floor(Math.random() * 20) + 1 + battler.agi;
+            }
+            battler.makeSpeed();
+        });
+        this._actionBattlers = combatants.sort(function(a, b) {
+            return b._initiative - a._initiative;
+        });
+    } else {
         this._actionBattlers = [];
-        return;
     }
-    
-    combatants.forEach(battler => {
-        battler._initiative = Math.floor(Math.random() * 20) + 1 + battler.agi;
-        battler.makeSpeed();
-        console.log(battler.name(), 'initiative:', battler._initiative);
-    });
-    
-    this._actionBattlers = combatants.sort((a, b) => b._initiative - a._initiative);
 
-    // makeActions() sets _actionState to 'undecided' but selectNextCommand
-    // only pauses for canInput() which requires 'inputting'.
-    // Set all actors to 'inputting' so they each get a command window.
-    $gameParty.battleMembers().forEach(function(actor) {
-        if (actor.canMove()) actor.setActionState('inputting');
-    });
-
-    console.log('Final action battlers:', this._actionBattlers.map(b => b.name()));
+    _TDarn_makingActionOrders = false;
 };
 
 //=============================================================================
@@ -839,11 +829,43 @@ BattleManager.startInput = function() {
     console.log('=== START INPUT ===');
     this._phase = 'input';
     this._actorIndex = -1;
-    // Roll initiative and allocate action slots on all battlers.
-    // makeActionOrders is our custom version that sorts by d20+agi.
+
+    // Allocate action slots FIRST (creates Game_Action objects).
+    // This triggers Yanfly's makeActionOrders hook, but the guard makes
+    // those calls no-ops. We then do the real initiative roll below.
+    $gameParty.makeActions();
+    $gameTroop.makeActions();
+
+    // Clear stale initiative so makeActionOrders rolls fresh this turn.
+    var everyone = $gameParty.aliveMembers().concat($gameTroop.aliveMembers());
+    everyone.forEach(function(b) { b._initiative = null; });
+
+    // Roll initiative and sort into _actionBattlers.
     this.makeActionOrders();
-    // Start presenting actor command windows
-    this.selectNextCommand();
+
+    // Log the final order.
+    if (this._actionBattlers) {
+        console.log('Initiative order:', this._actionBattlers.map(function(b) {
+            return b.name() + '(' + b._initiative + ')';
+        }).join(', '));
+    }
+
+    // makeActions() sets _actionState='undecided' but selectNextCommand requires
+    // 'inputting'. Set all actors to 'inputting' so each gets a command window.
+    $gameParty.battleMembers().forEach(function(actor) {
+        if (actor.canMove()) actor.setActionState('inputting');
+    });
+
+    // DO NOT call selectNextCommand() here. Vanilla startInput doesn't either.
+    // Scene_Battle's update loop calls it when the scene is ready.
+    // Calling it ourselves fires it before Yanfly's windows are initialized,
+    // so canInput() is false for all actors, causing immediate startTurn() and
+    // nobody ever gets a command window.
+    this.clearActor();
+    // If surprise attack or no one can input, skip straight to execution.
+    if (this._surprise || !$gameParty.canInput()) {
+        this.startTurn();
+    }
 };
 
 // startTurn: called by selectNextCommand when all actors have finished inputting.
@@ -852,22 +874,30 @@ BattleManager.startInput = function() {
 // which would overwrite our initiative-sorted order.
 BattleManager.startTurn = function() {
     console.log('=== START TURN: execution phase ===');
-    console.log('Turn order:', this._actionBattlers.map(b => b.name()));
+    console.log('Turn order:', this._actionBattlers.map(function(b) { return b.name(); }));
     this._phase = 'turn';
-    $gameParty.requestMotionRefresh();
-    if (SceneManager._scene && SceneManager._scene._logWindow) {
-        SceneManager._scene._logWindow.startTurn();
-    }
+    // Clear the log window exactly as vanilla does — Yanfly requires this.
+    if (this._logWindow) this._logWindow.clear();
+    // Vanilla startTurn assigns the first subject immediately. Without this,
+    // updateTurn sees _subject=null, calls getNextSubject() which shift()s
+    // everything off _actionBattlers in one loop, returns null, then endTurn
+    // fires → startInput → infinite loop with nobody ever acting.
+    this._subject = this.getNextSubject();
 };
 
 
 
+// Override getNextSubject completely with vanilla logic.
+// Yanfly's version (captured in _BattleManager_getNextSubject) returns null
+// without consuming _actionBattlers — its check is incompatible with our
+// initiative-based _actionBattlers array. Vanilla logic is exactly what we need:
+// shift battlers off until we find one that is alive and a battle member.
 BattleManager.getNextSubject = function() {
-    console.log('>>> getNextSubject CALLED <<<');
-    console.log('Current action battlers:', this._actionBattlers ? this._actionBattlers.map(b => b.name()) : 'none');
-    const result = _BattleManager_getNextSubject.call(this);
-    console.log('Returning:', result ? result.name() : 'null');
-    return result;
+    for (;;) {
+        var battler = this._actionBattlers.shift();
+        if (!battler) return null;
+        if (battler.isBattleMember() && battler.isAlive()) return battler;
+    }
 };
 
 //=============================================================================
@@ -941,6 +971,21 @@ Game_Enemy.prototype.name = function() {
 Game_Enemy.prototype.level = function() {
     return 1;
 };
+
+// Yanfly BattleEngineCore compatibility: Window_BattleEnemy.updateHelp calls
+// currentAction().needsSelection() which crashes if currentAction() is null.
+// This happens when the enemy window is activated before the actor has set
+// an action (e.g. during Move, or during Yanfly's display refresh calls).
+// Guard against null to prevent the TypeError crash.
+if (typeof Window_BattleEnemy !== 'undefined' &&
+    Window_BattleEnemy.prototype.updateHelp) {
+    var _Window_BattleEnemy_updateHelp = Window_BattleEnemy.prototype.updateHelp;
+    Window_BattleEnemy.prototype.updateHelp = function() {
+        var actor = BattleManager.actor();
+        if (actor && !actor.currentAction()) return; // no action yet, skip
+        _Window_BattleEnemy_updateHelp.call(this);
+    };
+}
 
 console.log('T-Darn Combat System loaded successfully!');
 
