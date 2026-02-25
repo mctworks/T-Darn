@@ -33,6 +33,9 @@ const _BattleManager_makeActionOrders = BattleManager.makeActionOrders;
 const _BattleManager_getNextSubject = BattleManager.getNextSubject;
 const _Window_ActorCommand_makeCommandList = Window_ActorCommand.prototype.makeCommandList;
 const _Scene_Battle_createActorCommandWindow = Scene_Battle.prototype.createActorCommandWindow;
+// Capture onSkillOk ONCE here at load time, before any overrides.
+// This is the Yanfly version (or vanilla if no Yanfly), saved as our base.
+const _Scene_Battle_onSkillOk_BASE = Scene_Battle.prototype.onSkillOk;
 
 //=============================================================================
 // Global Error Handler for Debugging
@@ -139,7 +142,6 @@ const getWeaponDamage = function(weapon) {
     
     const meta = weapon.meta;
     
-    // Format: <damage: 2d6> or <damage: 1d8>
     if (meta && meta.damage) {
         const match = meta.damage.match(/(\d+)d(\d+)/i);
         if (match) {
@@ -150,7 +152,6 @@ const getWeaponDamage = function(weapon) {
         }
     }
     
-    // Fallback to old tags for compatibility
     const dice = parseInt(meta && meta.damageDice) || 1;
     return { dice: dice, sides: 6 };
 };
@@ -171,6 +172,12 @@ const getWeaponRange = function(weapon) {
     return (weapon.meta && weapon.meta.range) || 'melee';
 };
 
+const getRecoil = function(weapon) {
+    if (!weapon) return 0;
+    const meta = weapon.meta;
+    return parseInt(meta.recoil) || 0;
+};
+
 //=============================================================================
 // Game_Action Overrides
 //=============================================================================
@@ -182,18 +189,54 @@ Game_Action.prototype.isMeleeAttack = function() {
     return !weapon || getWeaponRange(weapon) === 'melee';
 };
 
-const _Game_Action_apply = Game_Action.prototype.apply;
 Game_Action.prototype.apply = function(target) {
     const subject = this.subject();
     if (!subject) return;
-    // Guard self-target = move no-op. Skip all combat logic.
+    
+    // Guard: self-target guard action = Move no-op. Skip all combat logic.
     if (subject === target && this.isGuard && this.isGuard()) {
         target.result().clear();
         return;
     }
     
+    const skill = this.item();
     const weapon = subject.weapons ? subject.weapons()[0] : null;
     
+    // Check if this is a spell
+    if (skill && skill.meta && skill.meta.spellLevel) {
+        const baseLevel = parseInt(skill.meta.spellLevel);
+        const attackRoll = Math.floor(Math.random() * 20) + 1 + baseLevel;
+        const defenseRoll = Math.floor(Math.random() * 20) + 1 + target.agi;
+        const isNatural20 = (attackRoll - baseLevel) === 20;
+        
+        if (subject._interrupted) {
+            console.log(subject.name() + "'s spell was interrupted!");
+            $gameMessage.add(subject.name() + "'s spell was interrupted!");
+            subject._interrupted = false;
+            target.result().missed = true;
+            target.result().clear();
+            return;
+        }
+        
+        const distance = getRangeDistance(subject, target);
+        const rangeMod = getRangeModifier(distance);
+        const finalAttackRoll = attackRoll + rangeMod;
+
+        console.log(subject.name() + ' casting spell at ' + target.name() +
+                    ' | Base Level: ' + baseLevel +
+                    ' | Attack: ' + attackRoll +
+                    ' | Final: ' + finalAttackRoll +
+                    ' | Defense: ' + defenseRoll);
+        
+        if (finalAttackRoll > defenseRoll || isNatural20) {
+            this.applySpellDamage(target, isNatural20, skill);
+        } else {
+            this.checkParry(target);
+        }
+        return;
+    }
+    
+    // Normal melee/ranged attack
     const attackRoll = Math.floor(Math.random() * 20) + 1 + subject.agi + getWeaponSkill(weapon);
     const defenseRoll = Math.floor(Math.random() * 20) + 1 + target.agi;
     const isNatural20 = (attackRoll - subject.agi - getWeaponSkill(weapon)) === 20;
@@ -223,7 +266,7 @@ Game_Action.prototype.checkParry = function(target) {
     
     if (parryRoll >= blockDC) {
         target.result().missed = false;
-        target.result().evaded = false;  // evaded=true shows "Miss"; keep false so damage number shows
+        target.result().evaded = false;
         
         if (this.isMeleeAttack()) {
             target._parryPenalty = -1;
@@ -266,6 +309,36 @@ Game_Action.prototype.checkParry = function(target) {
     }
 };
 
+//=============================================================================
+// Power Level / Spell Energy
+//=============================================================================
+
+Game_Actor.prototype.powerLevel = function() {
+    try {
+        return this.param(9) || 0;
+    } catch (e) {
+        return 0;
+    }
+};
+
+const _Game_Actor_deserialize = Game_Actor.prototype.deserialize;
+Game_Actor.prototype.deserialize = function(data) {
+    _Game_Actor_deserialize.call(this, data);
+    this._spellEnergy = data._spellEnergy;
+};
+
+const _Game_Actor_onPlayerWalk = Game_Actor.prototype.onPlayerWalk;
+Game_Actor.prototype.onPlayerWalk = function() {
+    _Game_Actor_onPlayerWalk.call(this);
+    if (this._spellEnergy !== undefined && $gameParty.steps() % 20 === 0) {
+        this.restoreSpellEnergy(1);
+    }
+};
+
+//=============================================================================
+// Hit Application
+//=============================================================================
+
 Game_Action.prototype.applyHitWithLocation = function(target, isNatural20) {
     const hitLocation = determineHitLocation(target);
     
@@ -291,8 +364,6 @@ Game_Action.prototype.applyHitWithLocation = function(target, isNatural20) {
     
     const armors = target.armors ? target.armors() : [];
     const armorStrength = getArmorAtLocation(armors, hitLocation.armorType);
-    
-    if (isNaN(armorStrength) || !isFinite(armorStrength)) armorStrength = 0;
     
     let finalDamage = Math.max(0, damage - Math.floor(armorStrength / 2));
     
@@ -323,6 +394,50 @@ Game_Action.prototype.applyHitWithLocation = function(target, isNatural20) {
                 (isNatural20 ? ' | CRITICAL!' : ''));
 };
 
+//=============================================================================
+// Spell Damage
+//=============================================================================
+
+Game_Action.prototype.applySpellDamage = function(target, isNatural20, skill) {
+    const subject = this.subject();
+    const baseLevel = parseInt(skill.meta.spellLevel);
+    const powerLevel = subject.powerLevel ? subject.powerLevel() : 0;
+    // Use actor's selected level if available, otherwise use base level
+    const actualLevel = (subject._selectedSpellLevel || baseLevel) + powerLevel;
+    
+    const hitLocation = determineHitLocation(target);
+    
+    let damage = 0;
+    for (let i = 0; i < actualLevel; i++) {
+        damage += Math.floor(Math.random() * 6) + 1;
+    }
+    
+    let finalDamage = damage;
+    
+    if (isNatural20) {
+        finalDamage *= 2;
+    }
+    
+    finalDamage = Math.floor(finalDamage * hitLocation.multiplier);
+    
+    if (finalDamage < 1) finalDamage = 1;
+    
+    target.result().clear();
+    target.result().hpDamage = finalDamage;
+    target.result().hpAffected = true;
+    target.gainHp(-finalDamage);
+    target.result().hitLocation = hitLocation.name;
+    
+    if (isNatural20) {
+        target.result().critical = true;
+    }
+    
+    target.startDamagePopup();
+    
+    console.log(subject.name() + "'s spell hit " + target.name() + 
+                ' for ' + finalDamage + ' damage | Location: ' + hitLocation.name);
+};
+
 const _Game_Battler_makeSpeed = Game_Battler.prototype.makeSpeed;
 Game_Battler.prototype.makeSpeed = function() {
     _Game_Battler_makeSpeed.call(this);
@@ -333,17 +448,194 @@ Game_Battler.prototype.makeSpeed = function() {
 };
 
 //=============================================================================
+// Spell Interruption System
+//=============================================================================
+
+const _Game_Action_executeDamage = Game_Action.prototype.executeDamage;
+Game_Action.prototype.executeDamage = function(target, value) {
+    _Game_Action_executeDamage.call(this, target, value);
+    
+    const subject = this.subject();
+    if (subject && subject.isActor()) {
+        if (target._isCasting) {
+            if (Math.random() < 0.5) {
+                target._interrupted = true;
+                console.log(target.name() + "'s spell was interrupted!");
+            }
+        }
+    }
+};
+
+const _BattleManager_endTurn = BattleManager.endTurn;
+BattleManager.endTurn = function() {
+    this.allBattleMembers().forEach(function(battler) {
+        battler._isCasting = false;
+        battler._interrupted = false;
+    });
+    _BattleManager_endTurn.call(this);
+};
+
+//=============================================================================
+// Spell Level Window
+//=============================================================================
+
+function Window_SpellLevel() {
+    this.initialize.apply(this, arguments);
+}
+
+Window_SpellLevel.prototype = Object.create(Window_Command.prototype);
+Window_SpellLevel.prototype.constructor = Window_SpellLevel;
+
+Window_SpellLevel.prototype.initialize = function(x, y) {
+    Window_Command.prototype.initialize.call(this, x, y);
+    this._skill = null;
+    this._actor = null;
+    this.deactivate();
+    this.select(-1);
+};
+
+Window_SpellLevel.prototype.windowWidth = function() {
+    return 250;
+};
+
+Window_SpellLevel.prototype.makeCommandList = function() {
+    if (!this._skill || !this._actor) {
+        this.addCommand('Selecting spell...', 'cancel', false);
+        return;
+    }
+    
+    let powerLevel = 0;
+    try {
+        powerLevel = this._actor.powerLevel ? this._actor.powerLevel() : 0;
+    } catch (e) {
+        powerLevel = 0;
+    }
+    
+    for (let i = 1; i <= 5; i++) {
+        const castLevel = i;
+        const actualLevel = castLevel + powerLevel;
+        const mpCost = actualLevel;
+        const commandName = 'Level ' + castLevel + ' (' + actualLevel + ') - ' + mpCost + ' MP';
+        this.addCommand(commandName, 'level' + castLevel, this._actor.mp >= mpCost);
+    }
+};
+
+Window_SpellLevel.prototype.setSkill = function(skill, actor) {
+    this._skill = skill;
+    this._actor = actor;
+    this.refresh();
+};
+
+//=============================================================================
+// Spell Level Selection — onSkillOk / onSpellLevelSelect
+//
+// Flow:
+//   Actor selects a spell in Window_BattleSkill
+//   → onSkillOk fires
+//   → If spell, hide skill/command windows, show spell level window
+//   → Actor picks a level → onSpellLevelSelect(level) fires
+//   → Store level on actor, hide spell level window
+//   → Call BattleManager.inputtingAction().setSkill() directly
+//     (bypasses Yanfly's onSkillOk which calls inputtingAction() — safe
+//      because we do it while the actor is still the inputting actor)
+//   → Call selectEnemySelection() or selectActorSelection() for target pick
+//
+// Why NOT call _Scene_Battle_onSkillOk_BASE from onSpellLevelSelect:
+//   Yanfly's onSkillOk calls BattleManager.actor().inputtingAction() which
+//   works during the skill window phase, but by the time onSpellLevelSelect
+//   fires the actor command/skill windows have been torn down and actor()
+//   may return null or have no inputtingAction, causing the crash.
+//=============================================================================
+
+Scene_Battle.prototype.onSkillOk = function() {
+    const skill = this._skillWindow.item();
+    const actor = BattleManager.actor();
+    
+    if (skill && skill.meta && skill.meta.spellLevel && !this._skipSpellLevelCheck) {
+        // This is a spell — intercept and show spell level picker first.
+        this._skillWindow.deactivate();
+        this._skillWindow.hide();
+        this._actorCommandWindow.deactivate();
+        this._actorCommandWindow.hide();
+        
+        this._spellLevelWindow.setSkill(skill, actor);
+        this._spellLevelWindow.show();
+        this._spellLevelWindow.activate();
+        this._spellLevelWindow.select(0);
+        
+        console.log('Spell level window activated');
+    } else {
+        // Normal skill or second pass (after spell level chosen) — use base flow.
+        _Scene_Battle_onSkillOk_BASE.call(this);
+    }
+};
+
+Scene_Battle.prototype.onSpellLevelSelect = function(level) {
+    const actor = this._spellLevelWindow._actor;
+    const skill = this._spellLevelWindow._skill;
+    
+    if (!actor || !skill) {
+        console.log('SpellLevel: No actor or skill, cancelling');
+        this._spellLevelWindow.hide();
+        this._spellLevelWindow.deactivate();
+        this._skillWindow.show();
+        this._skillWindow.activate();
+        return;
+    }
+    
+    console.log('Spell level ' + level + ' selected for ' + actor.name());
+    
+    // Tear down spell level window completely.
+    this._spellLevelWindow.deactivate();
+    this._spellLevelWindow.hide();
+    this._spellLevelWindow.active = false;
+    
+    // Store chosen level on actor so applySpellDamage can use it.
+    actor._selectedSpellLevel = level;
+    actor._isCasting = true;
+    
+    // Set MP cost so the engine deducts the right amount.
+    const powerLevel = actor.powerLevel ? actor.powerLevel() : 0;
+    skill.mpCost = level + powerLevel;
+    
+    // Commit the skill to the actor's current action directly.
+    // We must do this while actor is still the inputting actor.
+    // Yanfly's onSkillOk does: inputtingAction().setSkill(skill.id) then
+    // routes to target selection. We replicate just that essential part.
+    var action = actor.inputtingAction();
+    if (!action) {
+        // Fallback: actor has no inputting action (shouldn't happen, but guard it)
+        console.log('SpellLevel: inputtingAction is null, falling back');
+        this._skillWindow.show();
+        this._skillWindow.activate();
+        return;
+    }
+    
+    action.setSkill(skill.id);
+    
+    // Now route to target selection based on skill scope.
+    // skill.scope: 1=one enemy, 2=all enemies, 7=one ally, 8=all allies, etc.
+    if (skill.scope === 1 || skill.scope === 2 || skill.scope === 5 || skill.scope === 6) {
+        // Enemy targets
+        this.selectEnemySelection();
+    } else if (skill.scope === 7 || skill.scope === 8 || skill.scope === 9 || skill.scope === 10) {
+        // Ally targets  
+        this.selectActorSelection();
+    } else {
+        // No target needed (scope 11 = everyone, or self) — call base onSkillOk
+        // with flag set so it skips the spell intercept.
+        this._skipSpellLevelCheck = true;
+        this._skillWindow.show();
+        this._skillWindow.activate();
+        _Scene_Battle_onSkillOk_BASE.call(this);
+        this._skipSpellLevelCheck = false;
+    }
+};
+
+//=============================================================================
 // BattleManager Initiative Override
 //=============================================================================
 
-// Module-level guard so re-entrancy protection works regardless of `this` context.
-// YEP_X_TurnOrderDisplay hooks Game_Action.clear() → calls makeActionOrders every
-// time a new Game_Action is created. makeActions() creates Game_Actions, so without
-// this guard we get: makeActions → new Game_Action → clear → makeActionOrders →
-// makeActions → ... infinite loop. The guard makes re-entrant calls no-ops.
-// makeActions() is intentionally NOT called here — it lives in startInput so that
-// Yanfly's legitimate calls to makeActionOrders (for display refresh) don't
-// re-allocate action slots and wipe actors' chosen actions mid-turn.
 var _TDarn_makingActionOrders = false;
 
 BattleManager.makeActionOrders = function() {
@@ -356,7 +648,6 @@ BattleManager.makeActionOrders = function() {
 
     if (combatants.length > 0) {
         combatants.forEach(function(battler) {
-            // Only re-roll initiative if not already set this turn
             if (battler._initiative === undefined || battler._initiative === null) {
                 battler._initiative = Math.floor(Math.random() * 20) + 1 + battler.agi;
             }
@@ -378,7 +669,6 @@ BattleManager.makeActionOrders = function() {
 
 Game_Actor.prototype.setBattlePosition = function(column) {
     this._battleColumn = Math.max(0, Math.min(3, column));
-    
     if (SceneManager._scene && SceneManager._scene._spriteset) {
         SceneManager._scene._spriteset.updateActorPositions();
     }
@@ -399,11 +689,8 @@ Game_Enemy.prototype.battlePosition = function() {
 function getRangeDistance(attacker, target) {
     const attackerPos = attacker.battlePosition ? attacker.battlePosition() : 1;
     const targetPos = target.battlePosition ? target.battlePosition() : 1;
-    
     if (attacker.isActor() === target.isActor()) return 0;
-    
-    const distance = Math.abs(attackerPos - targetPos);
-    return distance;
+    return Math.abs(attackerPos - targetPos);
 }
 
 function getRangeModifier(distance) {
@@ -435,25 +722,16 @@ Spriteset_Battle.prototype.updateActorPositions = function() {
     const baseX = 700;
     const baseY = Graphics.height - 200;
     const spacing = 100;
-    const backRowOffset = 60;
-    const backRowYOffset = 30;
     
     for (let i = 0; i < this._actorSprites.length; i++) {
         const sprite = this._actorSprites[i];
         const actor = members[i];
         if (sprite && actor) {
-            const column = actor.battlePosition ? actor.battlePosition() : 1;
-            
-            let x = baseX - (i * spacing);
-            let y = baseY;
-            
-            // All columns use same scale/opacity — position only
             sprite.opacity = 255;
             sprite.scale.x = 1.0;
             sprite.scale.y = 1.0;
-            
-            sprite.x = x;
-            sprite.y = y;
+            sprite.x = baseX - (i * spacing);
+            sprite.y = baseY;
         }
     }
 };
@@ -495,8 +773,6 @@ Window_MoveCommand.prototype.initialize = function(x, y) {
     Window_Command.prototype.initialize.call(this, x, y);
     this._actor = null;
     this._moveChoice = null;
-    // Window_Command.initialize leaves window active with index 0 selected.
-    // Deactivate so it doesn't steal the first keypress on battle start.
     this.deactivate();
     this.select(-1);
 };
@@ -532,15 +808,13 @@ Window_MoveCommand.prototype.processOk = function() {
 // Move Command System
 //=============================================================================
 
-// Add Move command to actor commands (guard against duplicates on refresh)
 Window_ActorCommand.prototype.makeCommandList = function() {
     _Window_ActorCommand_makeCommandList.call(this);
-    if (!this._list.some(cmd => cmd.symbol === 'move')) {
+    if (!this._list.some(function(cmd) { return cmd.symbol === 'move'; })) {
         this.addCommand('Move', 'move', true);
     }
 };
 
-// Scene_Battle additions
 Scene_Battle.prototype.createAllWindows = function() {
     _Scene_Battle_createAllWindows.call(this);
     
@@ -548,13 +822,21 @@ Scene_Battle.prototype.createAllWindows = function() {
     this._moveWindow.setHandler('forward', this.onMoveForward.bind(this));
     this._moveWindow.setHandler('back', this.onMoveBack.bind(this));
     this._moveWindow.setHandler('cancel', this.onMoveCancel.bind(this));
-    
     this._moveWindow.x = Graphics.boxWidth - this._moveWindow.width;
     this._moveWindow.y = this._statusWindow.y - this._moveWindow.height;
-    
     this.addWindow(this._moveWindow);
     this._moveWindow.hide();
     console.log('Move window created');
+    
+    this._spellLevelWindow = new Window_SpellLevel(0, 0);
+    this._spellLevelWindow.x = Graphics.boxWidth - this._spellLevelWindow.width;
+    this._spellLevelWindow.y = this._statusWindow.y - this._spellLevelWindow.height;
+    this.addWindow(this._spellLevelWindow);
+    this._spellLevelWindow.hide();
+    
+    for (let i = 1; i <= 5; i++) {
+        this._spellLevelWindow.setHandler('level' + i, this.onSpellLevelSelect.bind(this, i));
+    }
 };
 
 Scene_Battle.prototype.isAnyInputWindowActive = function() {
@@ -564,26 +846,21 @@ Scene_Battle.prototype.isAnyInputWindowActive = function() {
             this._itemWindow.active ||
             this._actorWindow.active ||
             this._enemyWindow.active ||
-            (this._moveWindow && this._moveWindow.active));
+            (this._moveWindow && this._moveWindow.active) ||
+            (this._spellLevelWindow && this._spellLevelWindow.active));
 };
 
-// Handle Move selection
 Scene_Battle.prototype.createActorCommandWindow = function() {
     _Scene_Battle_createActorCommandWindow.call(this);
     this._actorCommandWindow.setHandler('move', this.onMove.bind(this));
     console.log('Move handler set');
 };
 
-// Ensure the actor command window is always visible when an actor needs to input.
-// onMove() calls hide() on it, and Window_ActorCommand.setup() only calls open()
-// (which controls the slide animation), NOT show() (which controls visibility).
-// So after a Move command, the window is invisible for all subsequent actors.
 Scene_Battle.prototype.startActorCommandSelection = function() {
     this._actorCommandWindow.show();
     this._actorCommandWindow.setup(BattleManager.actor());
 };
 
-// Move command handlers
 Scene_Battle.prototype.onMove = function() {
     console.log('=== MOVE COMMAND SELECTED ===');
     const actor = BattleManager.actor();
@@ -607,32 +884,22 @@ Scene_Battle.prototype.onMove = function() {
 Scene_Battle.prototype.onMoveForward = function() {
     console.log('=== MOVE FORWARD SELECTED ===');
     const actor = this._moveActor;
-    if (!actor) {
-        this.cancelMove();
-        return;
-    }
-    
+    if (!actor) { this.cancelMove(); return; }
     actor._moveDirection = 'forward';
     actor._moveModifier = 1;
     console.log(actor.name(), 'will move forward with +1 modifier');
-    BattleManager._targetIndex = -1; // Clear any target selection
-    
+    BattleManager._targetIndex = -1;
     this.completeMove(actor);
 };
 
 Scene_Battle.prototype.onMoveBack = function() {
     console.log('=== MOVE BACK SELECTED ===');
     const actor = this._moveActor;
-    if (!actor) {
-        this.cancelMove();
-        return;
-    }
-    
+    if (!actor) { this.cancelMove(); return; }
     actor._moveDirection = 'back';
     actor._moveModifier = -1;
     console.log(actor.name(), 'will move back with -1 modifier');
-    BattleManager._targetIndex = -1; // Clear any target selection
-    
+    BattleManager._targetIndex = -1;
     this.completeMove(actor);
 };
 
@@ -643,34 +910,22 @@ Scene_Battle.prototype.onMoveCancel = function() {
 
 Scene_Battle.prototype.cancelMove = function() {
     console.log('=== CANCEL MOVE ===');
-    
     this._moveWindow.hide();
     this._moveWindow.deactivate();
-    
     if (this._moveActor) {
         this._moveActor._moveAction = false;
         this._moveActor._moveDirection = null;
         this._moveActor._moveModifier = 0;
         this._moveActor = null;
     }
-    
     this._actorCommandWindow.show();
     this._actorCommandWindow.activate();
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+//=============================================================================
 // Move Animation System
-//
-// Timeline:
-//   Menu selection  → actor starts walk cycle (motion only, no position change)
-//   All menus done  → combat execution phase begins normally
-//   Actor's turn    → sprite slides to new column position over ~20 frames
-//                     walk cycle continues during slide, then returns to normal
-//
-// Actors with a pending move store their direction in actor._pendingMoveDir.
-// ─────────────────────────────────────────────────────────────────────────────
+//=============================================================================
 
-// Helper: find the Sprite_Actor for a given Game_Actor
 Scene_Battle.prototype.getActorSprite = function(actor) {
     var ss = this._spriteset;
     if (!ss || !ss._actorSprites) return null;
@@ -690,7 +945,6 @@ Scene_Battle.prototype.completeMove = function(actor) {
     if (actor) {
         var dir = actor._moveDirection;
 
-        // Apply logical position change immediately for correct range calculations
         if (dir === 'forward') {
             actor.moveForward();
             console.log(actor.name(), 'logical position ->', actor.battlePosition());
@@ -699,39 +953,31 @@ Scene_Battle.prototype.completeMove = function(actor) {
             console.log(actor.name(), 'logical position ->', actor.battlePosition());
         }
 
-        // Store direction for the execution-phase animation
         actor._pendingMoveDir = dir;
         actor._moveDirection = null;
         actor._moveModifier = 0;
         actor._moveAction = false;
 
-        // Start walk cycle now (pure visual, no position change yet)
         var sprite = this.getActorSprite(actor);
         if (sprite && sprite.startMotion) {
             sprite.startMotion('walk', true);
         }
 
-        // Set Guard as the action for this actor's execution-phase slot
         if (actor.inputtingAction && actor.inputtingAction()) {
             actor.inputtingAction().setGuard();
         }
     }
 
-    // Advance to next actor's command window immediately — no delay
     BattleManager.selectNextCommand();
 };
 
-// Intercept processTurn to play the move animation BEFORE the action executes.
-// We must intercept here (not in startAction) because processTurn calls
-// removeCurrentAction() immediately after startAction returns — if we delayed
-// inside startAction, the action would be gone by the time the timer fires.
 const _BattleManager_processTurn = BattleManager.processTurn;
 BattleManager.processTurn = function() {
     var subject = this._subject;
     if (subject && subject.isActor() && subject._pendingMoveDir) {
         var scene = SceneManager._scene;
         if (scene && scene.playMoveAnimation) {
-            this._phase = 'animate'; // pause battle loop
+            this._phase = 'animate';
             scene.playMoveAnimation(subject);
             return;
         }
@@ -739,8 +985,6 @@ BattleManager.processTurn = function() {
     _BattleManager_processTurn.call(this);
 };
 
-// Slide the actor sprite to their new column position.
-// When done, restores phase and re-runs processTurn so the action executes normally.
 Scene_Battle.prototype.playMoveAnimation = function(actor) {
     var sprite = this.getActorSprite(actor);
     var dir = actor._pendingMoveDir;
@@ -759,17 +1003,11 @@ Scene_Battle.prototype.playMoveAnimation = function(actor) {
         _BattleManager_processTurn.call(BattleManager);
     };
 
-    if (!sprite) {
-        finish();
-        return;
-    }
+    if (!sprite) { finish(); return; }
 
-    // Walk cycle facing left (toward enemies) regardless of move direction
     if (sprite.setDirection) sprite.setDirection(4);
     if (sprite.startMotion) sprite.startMotion('walk', true);
 
-    // startMove() offsets from _homeX and snaps back when done — not permanent.
-    // Lerp x manually each frame and update _homeX so the sprite stays put.
     var startX = sprite.x;
     var destX = sprite.x + offsetX;
     sprite._homeX = destX;
@@ -782,20 +1020,18 @@ Scene_Battle.prototype.playMoveAnimation = function(actor) {
     this._moveAnimFinish = finish;
 };
 
-// Tick the move animation timer every frame.
 const _Scene_Battle_update = Scene_Battle.prototype.update;
 Scene_Battle.prototype.update = function() {
     _Scene_Battle_update.call(this);
     if (this._moveAnimTimer !== null && this._moveAnimTimer !== undefined) {
         this._moveAnimTimer++;
-        // Lerp the sprite x toward destination each frame
         var sp = this._moveAnimSprite;
         if (sp && this._moveAnimDuration > 0) {
             var t = Math.min(this._moveAnimTimer / this._moveAnimDuration, 1);
             sp.x = this._moveAnimStartX + (this._moveAnimDestX - this._moveAnimStartX) * t;
         }
         if (this._moveAnimTimer >= this._moveAnimDuration) {
-            if (sp) sp.x = this._moveAnimDestX; // snap exact
+            if (sp) sp.x = this._moveAnimDestX;
             var fn = this._moveAnimFinish;
             this._moveAnimTimer = null;
             this._moveAnimDuration = null;
@@ -816,88 +1052,147 @@ console.log('Move command system loaded');
 
 Scene_Battle.prototype.start = function() {
     console.log('=== BATTLE STARTED ===');
-    console.log('Party members:', $gameParty.members().map(m => m.name()));
-    console.log('Troop members:', $gameTroop.members().map(m => m.name()));
-    // Do NOT call makeActionOrders here — startBattle→startInput does it.
+    console.log('Party members:', $gameParty.members().map(function(m) { return m.name(); }));
+    console.log('Troop members:', $gameTroop.members().map(function(m) { return m.name(); }));
     _Scene_Battle_start.call(this);
 };
 
-// startInput: runs at battle start AND after each turn ends (via endTurn).
-// This is where actors choose their actions. We override to control timing of
-// makeActionOrders and to reset actorIndex correctly.
 BattleManager.startInput = function() {
     console.log('=== START INPUT ===');
     this._phase = 'input';
     this._actorIndex = -1;
 
-    // Allocate action slots FIRST (creates Game_Action objects).
-    // This triggers Yanfly's makeActionOrders hook, but the guard makes
-    // those calls no-ops. We then do the real initiative roll below.
     $gameParty.makeActions();
     $gameTroop.makeActions();
 
-    // Clear stale initiative so makeActionOrders rolls fresh this turn.
     var everyone = $gameParty.aliveMembers().concat($gameTroop.aliveMembers());
     everyone.forEach(function(b) { b._initiative = null; });
 
-    // Roll initiative and sort into _actionBattlers.
     this.makeActionOrders();
 
-    // Log the final order.
     if (this._actionBattlers) {
         console.log('Initiative order:', this._actionBattlers.map(function(b) {
             return b.name() + '(' + b._initiative + ')';
         }).join(', '));
     }
 
-    // makeActions() sets _actionState='undecided' but selectNextCommand requires
-    // 'inputting'. Set all actors to 'inputting' so each gets a command window.
     $gameParty.battleMembers().forEach(function(actor) {
         if (actor.canMove()) actor.setActionState('inputting');
     });
 
-    // DO NOT call selectNextCommand() here. Vanilla startInput doesn't either.
-    // Scene_Battle's update loop calls it when the scene is ready.
-    // Calling it ourselves fires it before Yanfly's windows are initialized,
-    // so canInput() is false for all actors, causing immediate startTurn() and
-    // nobody ever gets a command window.
     this.clearActor();
-    // If surprise attack or no one can input, skip straight to execution.
     if (this._surprise || !$gameParty.canInput()) {
         this.startTurn();
     }
 };
 
-// startTurn: called by selectNextCommand when all actors have finished inputting.
-// Sets up the execution phase using the _actionBattlers order from makeActionOrders.
-// Do NOT call vanilla _BattleManager_startTurn — it calls makeActionOrders() again
-// which would overwrite our initiative-sorted order.
 BattleManager.startTurn = function() {
     console.log('=== START TURN: execution phase ===');
     console.log('Turn order:', this._actionBattlers.map(function(b) { return b.name(); }));
     this._phase = 'turn';
-    // Clear the log window exactly as vanilla does — Yanfly requires this.
     if (this._logWindow) this._logWindow.clear();
-    // Vanilla startTurn assigns the first subject immediately. Without this,
-    // updateTurn sees _subject=null, calls getNextSubject() which shift()s
-    // everything off _actionBattlers in one loop, returns null, then endTurn
-    // fires → startInput → infinite loop with nobody ever acting.
     this._subject = this.getNextSubject();
 };
 
-
-
-// Override getNextSubject completely with vanilla logic.
-// Yanfly's version (captured in _BattleManager_getNextSubject) returns null
-// without consuming _actionBattlers — its check is incompatible with our
-// initiative-based _actionBattlers array. Vanilla logic is exactly what we need:
-// shift battlers off until we find one that is alive and a battle member.
 BattleManager.getNextSubject = function() {
     for (;;) {
         var battler = this._actionBattlers.shift();
         if (!battler) return null;
         if (battler.isBattleMember() && battler.isAlive()) return battler;
     }
+};
+
+//=============================================================================
+// Shield Spell
+//=============================================================================
+
+Game_Action.prototype.applyShieldSpell = function(target, level) {
+    const subject = this.subject();
+    const baseLevel = parseInt(this.item().meta.spellLevel);
+    const powerLevel = subject.powerLevel ? subject.powerLevel() : 0;
+    const actualLevel = baseLevel + powerLevel;
+    const shieldStrength = actualLevel * 10;
+    
+    target._shieldActive = true;
+    target._shieldStrength = shieldStrength;
+    
+    console.log(target.name() + ' gains a shield with ' + shieldStrength + ' HP!');
+    if (SceneManager._scene && SceneManager._scene._logWindow) {
+        SceneManager._scene._logWindow.addText(target.name() + ' casts Shield (' + shieldStrength + ' HP)');
+    }
+    
+    target.result().clear();
+    target.result().hpAffected = false;
+};
+
+const _Game_Action_executeDamage_shield = Game_Action.prototype.executeDamage;
+Game_Action.prototype.executeDamage = function(target, value) {
+    if (target._shieldActive && value > 0) {
+        const damageToShield = Math.min(target._shieldStrength, value);
+        const damageToTarget = value - damageToShield;
+        target._shieldStrength -= damageToShield;
+        console.log('Shield absorbed ' + damageToShield + ' damage, ' + target._shieldStrength + ' remaining');
+        if (target._shieldStrength <= 0) {
+            target._shieldActive = false;
+            console.log('Shield shattered!');
+        }
+        if (damageToTarget > 0) {
+            _Game_Action_executeDamage_shield.call(this, target, damageToTarget);
+        } else {
+            target.result().hpDamage = 0;
+            target.result().hpAffected = false;
+        }
+    } else {
+        _Game_Action_executeDamage_shield.call(this, target, value);
+    }
+};
+
+//=============================================================================
+// Regeneration Spell
+//=============================================================================
+
+Game_Action.prototype.applyRegenerateSpell = function(target, level) {
+    const subject = this.subject();
+    const baseLevel = parseInt(this.item().meta.spellLevel);
+    const powerLevel = subject.powerLevel ? subject.powerLevel() : 0;
+    const actualLevel = baseLevel + powerLevel;
+    const healAmount = actualLevel;
+    
+    target.gainHp(healAmount);
+    console.log(target.name() + ' regenerates ' + healAmount + ' HP!');
+    if (SceneManager._scene && SceneManager._scene._logWindow) {
+        SceneManager._scene._logWindow.addText(target.name() + ' regenerates ' + healAmount + ' HP');
+    }
+    
+    target.result().clear();
+    target.result().hpDamage = -healAmount;
+    target.result().hpAffected = true;
+    target.startDamagePopup();
+};
+
+//=============================================================================
+// Firearm System
+//=============================================================================
+
+Game_Action.prototype.applyFirearmEffects = function(subject, target) {
+    const weapon = subject.weapons ? subject.weapons()[0] : null;
+    if (!weapon || !weapon.meta || !weapon.meta.recoil) return;
+    const recoil = getRecoil(weapon);
+    const bod = subject.atk;
+    if (recoil > bod * 2) {
+        target.addState(11);
+        if (subject.moveBackward) subject.moveBackward();
+        console.log(subject.name() + ' is knocked back by massive recoil!');
+    }
+};
+
+Game_Action.prototype.checkOverpenetration = function(target, damage) {
+    const bod = target.atk;
+    const weapon = this.subject().weapons ? this.subject().weapons()[0] : null;
+    if (!weapon) return false;
+    let threshold = bod;
+    if (weapon.meta && weapon.meta.armorPiercing) threshold = Math.ceil(bod / 2);
+    return damage > threshold;
 };
 
 //=============================================================================
@@ -912,10 +1207,8 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
         if ($gameParty.inBattle()) {
             const combatants = $gameParty.members().concat($gameTroop.members());
             let msg = 'Initiative Order:\n';
-            combatants.sort((a, b) => b._initiative - a._initiative)
-                .forEach(b => {
-                    msg += b.name() + ': ' + b._initiative + '\n';
-                });
+            combatants.sort(function(a, b) { return b._initiative - a._initiative; })
+                .forEach(function(b) { msg += b.name() + ': ' + b._initiative + '\n'; });
             $gameMessage.add(msg);
         }
     }
@@ -937,9 +1230,8 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
             console.log('Battle phase:', BattleManager._phase);
             console.log('Actor index:', BattleManager._actorIndex);
             console.log('Current actor:', BattleManager.actor() ? BattleManager.actor().name() : 'none');
-            console.log('Action battlers:', BattleManager._actionBattlers ? BattleManager._actionBattlers.map(b => b.name()) : 'none');
+            console.log('Action battlers:', BattleManager._actionBattlers ? BattleManager._actionBattlers.map(function(b) { return b.name(); }) : 'none');
             console.log('Subject:', BattleManager._subject ? BattleManager._subject.name() : 'none');
-            console.log('Action state:', BattleManager.actor() ? BattleManager.actor()._actionState : 'none');
         }
     }
 };
@@ -949,40 +1241,24 @@ Game_Interpreter.prototype.pluginCommand = function(command, args) {
 //=============================================================================
 
 Game_Actor.prototype.weapons = function() {
-    return this.equips().filter(item => item && DataManager.isWeapon(item));
+    return this.equips().filter(function(item) { return item && DataManager.isWeapon(item); });
 };
 
 Game_Actor.prototype.armors = function() {
-    return this.equips().filter(item => item && DataManager.isArmor(item));
+    return this.equips().filter(function(item) { return item && DataManager.isArmor(item); });
 };
 
-Game_Enemy.prototype.weapons = function() {
-    return [];
-};
+Game_Enemy.prototype.weapons = function() { return []; };
+Game_Enemy.prototype.armors = function() { return []; };
+Game_Enemy.prototype.name = function() { return this.enemy().name; };
+Game_Enemy.prototype.level = function() { return 1; };
 
-Game_Enemy.prototype.armors = function() {
-    return [];
-};
-
-Game_Enemy.prototype.name = function() {
-    return this.enemy().name;
-};
-
-Game_Enemy.prototype.level = function() {
-    return 1;
-};
-
-// Yanfly BattleEngineCore compatibility: Window_BattleEnemy.updateHelp calls
-// currentAction().needsSelection() which crashes if currentAction() is null.
-// This happens when the enemy window is activated before the actor has set
-// an action (e.g. during Move, or during Yanfly's display refresh calls).
-// Guard against null to prevent the TypeError crash.
-if (typeof Window_BattleEnemy !== 'undefined' &&
-    Window_BattleEnemy.prototype.updateHelp) {
+// Yanfly BattleEngineCore compatibility
+if (typeof Window_BattleEnemy !== 'undefined' && Window_BattleEnemy.prototype.updateHelp) {
     var _Window_BattleEnemy_updateHelp = Window_BattleEnemy.prototype.updateHelp;
     Window_BattleEnemy.prototype.updateHelp = function() {
         var actor = BattleManager.actor();
-        if (actor && !actor.currentAction()) return; // no action yet, skip
+        if (actor && !actor.currentAction()) return;
         _Window_BattleEnemy_updateHelp.call(this);
     };
 }
