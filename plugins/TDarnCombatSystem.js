@@ -101,7 +101,8 @@ function getCreatureType(battler) {
     if (battler.isEnemy()) {
         const enemy = battler.enemy();
         if (enemy && enemy.meta && enemy.meta.creatureType) {
-            return enemy.meta.creatureType;
+            // Trim whitespace — note tags can have trailing spaces
+            return enemy.meta.creatureType.trim();
         }
     }
     return DEFAULT_TYPE;
@@ -227,7 +228,26 @@ Game_Action.prototype.apply = function(target) {
                     ' | Attack: ' + attackRoll +
                     ' | Final: ' + finalAttackRoll +
                     ' | Defense: ' + defenseRoll);
-        
+
+        // Spell roll display
+        (function() {
+            var rawD20 = attackRoll - baseLevel;
+            var atkBreak = 'd20(' + rawD20 + ')+Lv' + baseLevel;
+            if (rangeMod) atkBreak += (rangeMod >= 0 ? '+' : '') + rangeMod + ' Range';
+            atkBreak += ' = ' + finalAttackRoll;
+            var defBreak = 'd20(' + (defenseRoll - target.agi) + ')' +
+                           (target.agi >= 0 ? '+' : '') + target.agi + ' = ' + defenseRoll;
+            var outcome = (finalAttackRoll > defenseRoll || isNatural20)
+                ? (isNatural20 ? '→ CRIT SPELL' : '→ SPELL HITS')
+                : '→ SPELL MISS';
+            TDarn.showRoll([
+                '✦ ' + subject.name() + ' casts at ' + target.name(),
+                'ATK: ' + atkBreak,
+                'DEF: ' + defBreak,
+                outcome
+            ]);
+        })();
+
         if (finalAttackRoll > defenseRoll || isNatural20) {
             this.applySpellDamage(target, isNatural20, skill);
         } else {
@@ -251,7 +271,29 @@ Game_Action.prototype.apply = function(target) {
                 ' | Attack Roll: ' + attackRoll + 
                 ' | Final: ' + finalAttackRoll + 
                 ' | Defense: ' + defenseRoll);
-    
+
+    // Build roll display lines
+    (function() {
+        var weaponName = weapon ? weapon.name : 'Unarmed';
+        var skillBonus = getWeaponSkill(weapon);
+        var atkBreak = 'd20(' + (attackRoll - subject.agi - skillBonus) + ')';
+        if (subject.agi) atkBreak += (subject.agi >= 0 ? '+' : '') + subject.agi + ' AGI';
+        if (skillBonus) atkBreak += (skillBonus >= 0 ? '+' : '') + skillBonus + ' Skill';
+        if (rangeMod) atkBreak += (rangeMod >= 0 ? '+' : '') + rangeMod + ' Range';
+        atkBreak += ' = ' + finalAttackRoll;
+        var defBreak = 'd20(' + (defenseRoll - target.agi) + ')' +
+                       (target.agi >= 0 ? '+' : '') + target.agi + ' AGI = ' + defenseRoll;
+        var outcome = (finalAttackRoll > defenseRoll || isNatural20)
+            ? (isNatural20 ? '→ CRIT' : '→ HIT')
+            : '→ MISS / Parry attempt';
+        TDarn.showRoll([
+            subject.name() + ' → ' + target.name() + ' [' + weaponName + ']',
+            'ATK: ' + atkBreak,
+            'DEF: ' + defBreak,
+            outcome
+        ]);
+    })();
+
     if (finalAttackRoll > defenseRoll || isNatural20) {
         this.applyHitWithLocation(target, isNatural20);
     } else {
@@ -392,6 +434,20 @@ Game_Action.prototype.applyHitWithLocation = function(target, isNatural20) {
                 ' | Location: ' + hitLocation.name + 
                 ' | Damage: ' + finalDamage +
                 (isNatural20 ? ' | CRITICAL!' : ''));
+
+    // Damage breakdown display
+    (function() {
+        var w = subject.weapons ? subject.weapons()[0] : null;
+        var wd = getWeaponDamage(w);
+        var diceStr = wd.dice + 'd' + wd.sides;
+        var locStr = hitLocation.name + ' (x' + hitLocation.multiplier + ')';
+        var armorNote = armorStrength > 0 ? ' -' + Math.floor(armorStrength/2) + ' armor' : '';
+        var critNote = isNatural20 ? ' ×2 CRIT' : '';
+        TDarn.showRoll([
+            '⚔ ' + target.name() + ' hit: ' + locStr,
+            diceStr + armorNote + critNote + ' → ' + finalDamage + ' dmg'
+        ]);
+    })();
 };
 
 //=============================================================================
@@ -436,6 +492,12 @@ Game_Action.prototype.applySpellDamage = function(target, isNatural20, skill) {
     
     console.log(subject.name() + "'s spell hit " + target.name() + 
                 ' for ' + finalDamage + ' damage | Location: ' + hitLocation.name);
+
+    TDarn.showRoll([
+        '✦ Spell: ' + actualLevel + 'd6' + (isNatural20 ? ' ×2 CRIT' : '') +
+        ' → ' + finalDamage + ' dmg',
+        'Location: ' + hitLocation.name + ' (x' + hitLocation.multiplier + ')'
+    ]);
 };
 
 const _Game_Battler_makeSpeed = Game_Battler.prototype.makeSpeed;
@@ -632,6 +694,141 @@ Scene_Battle.prototype.onSpellLevelSelect = function(level) {
     }
 };
 
+
+//=============================================================================
+// Dice Roll Display System
+//
+// Window_DiceRoll: a queue-based overlay that shows formatted roll results.
+// Each entry displays for ~180 frames (~3 seconds at 60fps) then fades out.
+// New entries stack vertically and scroll up as old ones expire.
+//
+// TDarn.showRoll(lines) — the single public API.
+//   lines: array of strings, e.g.:
+//     ['Harold attacks Punk', 'd20+4 = 17  vs  d20+2 = 11', '→ HIT (Torso)']
+//
+// Called from: initiative roll, attack apply, spell apply, damage rolls.
+//=============================================================================
+
+var TDarn = TDarn || {};
+
+// ── Core display function ─────────────────────────────────────────────────
+TDarn.showRoll = function(lines) {
+    var scene = SceneManager._scene;
+    if (scene && scene._diceRollWindow) {
+        scene._diceRollWindow.addEntry(lines);
+    }
+};
+
+// ── Window class ─────────────────────────────────────────────────────────
+function Window_DiceRoll() {
+    this.initialize.apply(this, arguments);
+}
+
+Window_DiceRoll.prototype = Object.create(Window_Base.prototype);
+Window_DiceRoll.prototype.constructor = Window_DiceRoll;
+
+Window_DiceRoll.ENTRY_DURATION = 220;  // frames before fade starts
+Window_DiceRoll.FADE_DURATION  = 40;   // frames to fade out
+Window_DiceRoll.LINE_HEIGHT    = 20;
+Window_DiceRoll.MAX_ENTRIES    = 5;
+Window_DiceRoll.WIN_W          = 380;
+
+Window_DiceRoll.prototype.initialize = function() {
+    var lineH = Window_DiceRoll.LINE_HEIGHT;
+    var pad = 18; // MV standard padding
+    var maxLines = Window_DiceRoll.MAX_ENTRIES * 4;
+    var w = Window_DiceRoll.WIN_W;
+    var h = maxLines * lineH + pad * 2 + 24; // extra buffer for entry spacing
+    var x = Math.floor((Graphics.boxWidth - w) / 2);
+    var y = 60;
+    Window_Base.prototype.initialize.call(this, x, y, w, h);
+    this.opacity = 0;        // transparent frame — content drawn directly
+    this.backOpacity = 0;
+    this._entries = [];
+    this._dirty = true;
+};
+
+Window_DiceRoll.prototype.addEntry = function(lines) {
+    if (this._entries.length >= Window_DiceRoll.MAX_ENTRIES) {
+        this._entries.shift(); // drop oldest if full
+    }
+    this._entries.push({
+        lines: lines,
+        timer: 0
+    });
+    this._dirty = true;
+};
+
+Window_DiceRoll.prototype.update = function() {
+    Window_Base.prototype.update.call(this);
+    if (this._entries.length === 0) return;
+
+    var changed = false;
+    var total = Window_DiceRoll.ENTRY_DURATION + Window_DiceRoll.FADE_DURATION;
+    for (var i = this._entries.length - 1; i >= 0; i--) {
+        this._entries[i].timer++;
+        if (this._entries[i].timer >= total) {
+            this._entries.splice(i, 1);
+            changed = true;
+        } else if (this._entries[i].timer > Window_DiceRoll.ENTRY_DURATION) {
+            changed = true; // opacity changes each fade frame
+        }
+    }
+    if (changed) this._dirty = true;
+    if (this._dirty) { this._dirty = false; this.refresh(); }
+};
+
+Window_DiceRoll.prototype.entryOpacity = function(entry) {
+    if (entry.timer <= Window_DiceRoll.ENTRY_DURATION) return 255;
+    var fadeProgress = entry.timer - Window_DiceRoll.ENTRY_DURATION;
+    return Math.round(255 * (1 - fadeProgress / Window_DiceRoll.FADE_DURATION));
+};
+
+Window_DiceRoll.prototype.refresh = function() {
+    this.contents.clear();
+    if (this._entries.length === 0) return;
+
+    var lineH = Window_DiceRoll.LINE_HEIGHT;
+    var pad = 4;
+    var y = 0;
+
+    for (var i = 0; i < this._entries.length; i++) {
+        var entry = this._entries[i];
+        var alpha = this.entryOpacity(entry);
+        var lines = entry.lines;
+
+        // Draw a subtle semi-transparent backing rect
+        var entryH = lines.length * lineH + pad * 2;
+        this.contents.fillRect(0, y, Window_DiceRoll.WIN_W - 36, entryH,
+            'rgba(0,0,0,' + (alpha / 255 * 0.55).toFixed(2) + ')');
+
+        // Draw each line with colour coding
+        for (var j = 0; j < lines.length; j++) {
+            var text = lines[j];
+            var color;
+            if (j === 0) {
+                color = 'rgba(255,230,100,' + (alpha/255).toFixed(2) + ')'; // gold header
+            } else if (text.indexOf('HIT') >= 0 || text.indexOf('CRIT') >= 0) {
+                color = 'rgba(255,100,100,' + (alpha/255).toFixed(2) + ')'; // red for hits
+            } else if (text.indexOf('MISS') >= 0 || text.indexOf('Parry') >= 0) {
+                color = 'rgba(150,200,255,' + (alpha/255).toFixed(2) + ')'; // blue for miss/parry
+            } else if (text.indexOf('Initiative') >= 0) {
+                color = 'rgba(180,255,180,' + (alpha/255).toFixed(2) + ')'; // green for initiative
+            } else {
+                color = 'rgba(255,255,255,' + (alpha/255).toFixed(2) + ')'; // white default
+            }
+            this.contents.fontSize = 15;
+            this.contents.textColor = color;
+            this.drawText(text, pad, y + pad + j * lineH, Window_DiceRoll.WIN_W - 36 - pad * 2, 'left');
+        }
+
+        y += entryH + 4;
+    }
+};
+
+// Inject window creation into Scene_Battle
+// (dice window created inside main createAllWindows below)
+
 //=============================================================================
 // BattleManager Initiative Override
 //=============================================================================
@@ -687,52 +884,422 @@ Game_Enemy.prototype.battlePosition = function() {
 };
 
 function getRangeDistance(attacker, target) {
-    const attackerPos = attacker.battlePosition ? attacker.battlePosition() : 1;
-    const targetPos = target.battlePosition ? target.battlePosition() : 1;
-    if (attacker.isActor() === target.isActor()) return 0;
-    return Math.abs(attackerPos - targetPos);
+    // Columns mirror each other: actor col 3 faces enemy col 3 at point blank.
+    // Separation = distance each side is from the centre line.
+    // Actor "distance from centre" = 3 - actorCol (0=vanguard, 3=back)
+    // Enemy "distance from centre" = 3 - enemyCol
+    // Total separation = 6 - actorCol - enemyCol, capped at 4 (5 range bands).
+    if (!attacker.battlePosition || !target.battlePosition) return 2; // default medium
+    if (attacker.isActor() === target.isActor()) return 0; // same side = no range penalty
+
+    var actorCol  = attacker.isActor() ? attacker.battlePosition() : target.battlePosition();
+    var enemyCol  = attacker.isActor() ? target.battlePosition()   : attacker.battlePosition();
+    var separation = (3 - actorCol) + (3 - enemyCol); // 0=point blank, 6=extreme
+    return Math.min(4, Math.max(0, separation));
 }
 
 function getRangeModifier(distance) {
-    switch(distance) {
-        case 0: return 4;
-        case 1: return 2;
-        case 2: return 0;
-        case 3: return -2;
-        case 4: return -4;
-        default: return -4;
-    }
+    // distance 0 = Point Blank (+4), 1 = Short (+2), 2 = Medium (0),
+    // 3 = Long (-2), 4 = Extreme (-4).
+    // Further away = harder to hit.
+    var mods = [4, 2, 0, -2, -4];
+    return mods[distance] !== undefined ? mods[distance] : -4;
 }
 
 //=============================================================================
 // Visual Positioning for Columns
 //=============================================================================
 
+// Hook createActors to immediately snap all actors to their column positions.
+// Without this, MV places actors with its own defaults and the lerp starts
+// from the wrong position.
 const _Spriteset_Battle_createActors = Spriteset_Battle.prototype.createActors;
 Spriteset_Battle.prototype.createActors = function() {
     _Spriteset_Battle_createActors.call(this);
     this.updateActorPositions();
 };
 
+// updateActorPositions replaced by column-aware version above
+
+
+//=============================================================================
+// Battlefield Column Layout
+//
+// The battlefield is divided into 4 columns, mirrored for actors vs enemies.
+// Column 0 = Back, 1 = Mid-Back, 2 = Mid-Front, 3 = Vanguard (front)
+//
+// Actor  col 0 → far right  (x≈760)    Enemy col 0 → far left  (x≈56)
+// Actor  col 1 → mid-right  (x≈630)    Enemy col 1 → mid-left  (x≈186)
+// Actor  col 2 → mid-left   (x≈500)    Enemy col 2 → mid-right (x≈316)
+// Actor  col 3 → vanguard   (x≈390)    Enemy col 3 → vanguard  (x≈426)
+//
+// Distance formula: |actorCol - (3 - enemyCol)| → range modifier applies.
+// (Enemy col 0 = "their back row" = furthest from actor col 3.)
+//=============================================================================
+
+// ── Column X positions ────────────────────────────────────────────────────
+TDarn.COLUMNS = 4;
+TDarn.COL_LABELS = ['Back', 'Mid', 'Front', 'Van'];
+
+// X centre for each actor column (right side of field, col 3 closest to centre)
+TDarn.actorColX = function(col) {
+    // col 0=far right, col 3=near centre
+    // Van (col 3) pulled right to 440 so actors don't overlap with enemy van (360)
+    var positions = [790, 650, 530, 440];
+    return positions[col] || positions[1];
+};
+
+// X centre for each enemy column (left side of field, col 3 closest to centre)
+TDarn.enemyColX = function(col) {
+    // col 0=far left, col 3=near centre (mirrors actors)
+    // Van (col 3) pulled left to 376 so enemies don't overlap with actor van (440)
+    var positions = [26, 166, 286, 376];
+    return positions[col] || positions[1];
+};
+
+// Shared Y positions for actors per their index (vertical spacing in their column)
+TDarn.actorRowY = function(memberIndex, totalMembers) {
+    // Spread actors vertically within their column.
+    // spacing=55 keeps them close; baseY=330 shifts group up so 4th member
+    // isn't cut off by the status window.
+    var baseY = 330;
+    var spacing = 55;
+    var totalHeight = (totalMembers - 1) * spacing;
+    return baseY - totalHeight / 2 + memberIndex * spacing;
+};
+
+// ── Battlefield Grid Background ───────────────────────────────────────────
+
+Spriteset_Battle.prototype.createBattlefieldGrid = function() {
+    var w = Graphics.width;
+    var h = Graphics.height;
+    var bmp = new Bitmap(w, h);
+
+    // Zone bands — 4 pairs (actor side + enemy side) with subtle alternating fill
+    var zoneColors = [
+        'rgba(20,20,60,0.18)',   // col 0 back — dark blue
+        'rgba(20,60,20,0.13)',   // col 1 mid-back — dark green
+        'rgba(60,40,10,0.13)',   // col 2 mid-front — dark amber
+        'rgba(60,10,10,0.18)'    // col 3 vanguard — dark red
+    ];
+
+    var actorXs = [790, 650, 530, 440];
+    var enemyXs = [26, 166, 286, 376];
+    var zoneHalfW = 55; // half-width of each column zone highlight
+
+    for (var col = 0; col < 4; col++) {
+        var color = zoneColors[col];
+
+        // Actor zone band
+        bmp.fillRect(actorXs[col] - zoneHalfW, 0, zoneHalfW * 2, h, color);
+        // Enemy zone band  
+        bmp.fillRect(enemyXs[col] - zoneHalfW, 0, zoneHalfW * 2, h, color);
+    }
+
+    // Vertical divider down the centre
+    bmp.fillRect(408, 80, 2, h - 120, 'rgba(255,255,255,0.12)');
+
+    // Column labels — actor side (bottom of screen)
+    var labelY = 160;
+    bmp.fontSize = 13;
+    for (var c = 0; c < 4; c++) {
+        bmp.textColor = 'rgba(200,210,255,0.75)';
+        bmp.drawText(TDarn.COL_LABELS[c], actorXs[c] - 30, labelY, 60, 20, 'center');
+    }
+    // Enemy side labels (mirrored: col 0 on their far left = "their back")
+    var enemyLabels = ['Back', 'Mid', 'Front', 'Van'];
+    for (var c = 0; c < 4; c++) {
+        bmp.textColor = 'rgba(255,180,180,0.65)';
+        bmp.drawText(enemyLabels[c], enemyXs[c] - 30, labelY, 60, 20, 'center');
+    }
+
+    // Horizontal ground line
+    bmp.fillRect(0, h - 78, w, 1, 'rgba(255,255,255,0.10)');
+
+    var sprite = new Sprite(bmp);
+    sprite.z = 0;
+    this._battlefieldGrid = sprite;
+    this._battleField.addChild(sprite); // add behind battler sprites
+};
+
+// Hook into Spriteset_Battle.createLowerLayer to add grid after battleback
+const _Spriteset_Battle_createLowerLayer = Spriteset_Battle.prototype.createLowerLayer;
+Spriteset_Battle.prototype.createLowerLayer = function() {
+    _Spriteset_Battle_createLowerLayer.call(this);
+    this.createBattlefieldGrid();
+};
+
+// ── Actor positioning ─────────────────────────────────────────────────────
+
+// Override setActorHome — this is what MV calls (via setBattler) to set the
+// resting position for each Sprite_Actor. Overriding here means our column
+// positions win at the point of creation, before updatePosition() ever runs.
+var _Sprite_Actor_setActorHome = Sprite_Actor.prototype.setActorHome;
+Sprite_Actor.prototype.setActorHome = function(index) {
+    // Find which Game_Actor this sprite belongs to
+    var members = $gameParty.battleMembers();
+    var actor = members[index];
+    if (actor && actor.battlePosition) {
+        var col = actor.battlePosition();
+        var total = members.length;
+        var tx = TDarn.actorColX(col);
+        var ty = TDarn.actorRowY(index, total);
+        this.setHome(tx, ty);
+    } else {
+        _Sprite_Actor_setActorHome.call(this, index);
+    }
+};
+
 Spriteset_Battle.prototype.updateActorPositions = function() {
-    console.log('updateActorPositions CALLED');
     if (!this._actorSprites) return;
-    
-    const members = $gameParty.battleMembers();
-    const baseX = 700;
-    const baseY = Graphics.height - 200;
-    const spacing = 100;
-    
-    for (let i = 0; i < this._actorSprites.length; i++) {
-        const sprite = this._actorSprites[i];
-        const actor = members[i];
-        if (sprite && actor) {
-            sprite.opacity = 255;
-            sprite.scale.x = 1.0;
-            sprite.scale.y = 1.0;
-            sprite.x = baseX - (i * spacing);
-            sprite.y = baseY;
+    var members = $gameParty.battleMembers();
+
+    for (var i = 0; i < this._actorSprites.length; i++) {
+        var sprite = this._actorSprites[i];
+        if (!sprite) continue;
+        // Match by _actor reference, not array index (MV may reverse order)
+        var actor = sprite._actor || sprite._battler;
+        if (!actor) {
+            // Fallback: match by index
+            actor = members[i];
         }
+        if (!actor) continue;
+
+        var col = actor.battlePosition ? actor.battlePosition() : 1;
+        var memberIndex = members.indexOf(actor);
+        var tx = TDarn.actorColX(col);
+        var ty = TDarn.actorRowY(memberIndex, members.length);
+
+        sprite.opacity = 255;
+        sprite.scale.x = 1.0;
+        sprite.scale.y = 1.0;
+        // setHome updates _homeX/_homeY and calls updatePosition immediately
+        sprite.setHome(tx, ty);
+        sprite._tdarnTargetX = tx;
+        sprite._tdarnTargetY = ty;
+    }
+};
+
+// Lerp _homeX/_homeY toward target each frame — since Sprite_Actor.updatePosition()
+// computes x/y FROM _homeX/_homeY, lerping the home values is the correct approach.
+const _Spriteset_Battle_update_pos = Spriteset_Battle.prototype.update;
+Spriteset_Battle.prototype.update = function() {
+    _Spriteset_Battle_update_pos.call(this);
+    if (!this._actorSprites) return;
+    var LERP = 0.18;
+    for (var i = 0; i < this._actorSprites.length; i++) {
+        var sp = this._actorSprites[i];
+        if (sp && sp._tdarnTargetX !== undefined) {
+            var dx = sp._tdarnTargetX - sp._homeX;
+            var dy = sp._tdarnTargetY - sp._homeY;
+            if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+                sp._homeX += dx * LERP;
+                sp._homeY += dy * LERP;
+            } else {
+                sp._homeX = sp._tdarnTargetX;
+                sp._homeY = sp._tdarnTargetY;
+            }
+        }
+    }
+};
+
+// ── Enemy positioning ──────────────────────────────────────────────────────
+
+// Override Spriteset_Battle to reposition enemy sprites after creation
+const _Spriteset_Battle_createEnemies = Spriteset_Battle.prototype.createEnemies;
+Spriteset_Battle.prototype.createEnemies = function() {
+    _Spriteset_Battle_createEnemies.call(this);
+    this.updateEnemyPositions();
+};
+
+Spriteset_Battle.prototype.updateEnemyPositions = function() {
+    if (!this._enemySprites) return;
+    var members = $gameTroop.aliveMembers();
+    var counts = [0, 0, 0, 0]; // how many enemies are already in each column
+
+    // Sort sprites to match $gameTroop.members() order
+    for (var i = 0; i < this._enemySprites.length; i++) {
+        var sprite = this._enemySprites[i];
+        if (!sprite) continue;
+        var enemy = sprite._enemy || (sprite._battler);
+        if (!enemy) continue;
+
+        var col = enemy.battlePosition ? enemy.battlePosition() : 2;
+        col = Math.max(0, Math.min(3, col));
+        var cx = TDarn.enemyColX(col);
+
+        // Stack multiple enemies in same column vertically
+        var stackIndex = counts[col];
+        counts[col]++;
+        var cy = 300 + stackIndex * 80;
+
+        // SVG enemies use _homeX/_homeY for their base position
+        sprite._homeX = cx;
+        sprite._homeY = cy;
+        sprite.x = cx;
+        sprite.y = cy;
+    }
+};
+
+//=============================================================================
+// Pre-Battle Formation Menu
+//
+// Accessible from Scene_Menu via a "Formation" command.
+// Shows party members as a list; arrow keys move them between columns 0-3.
+// Changes persist as _battleColumn on each Game_Actor.
+//=============================================================================
+
+// ── Add Formation command to main menu ───────────────────────────────────
+
+const _Window_MenuCommand_addOriginalCommands = Window_MenuCommand.prototype.addOriginalCommands;
+Window_MenuCommand.prototype.addOriginalCommands = function() {
+    _Window_MenuCommand_addOriginalCommands.call(this);
+    // Use symbol 'battleFormation' (not 'formation') to avoid clashing with
+    // Yanfly's native Formation (party reorder) command which uses 'formation'.
+    this.addCommand('Battle Pos.', 'battleFormation', true);
+};
+
+const _Scene_Menu_createCommandWindow_form = Scene_Menu.prototype.createCommandWindow;
+Scene_Menu.prototype.createCommandWindow = function() {
+    _Scene_Menu_createCommandWindow_form.call(this);
+    this._commandWindow.setHandler('battleFormation', this.commandFormation.bind(this));
+};
+
+Scene_Menu.prototype.commandFormation = function() {
+    SceneManager.push(Scene_Formation);
+};
+
+// ── Scene_Formation ───────────────────────────────────────────────────────
+
+function Scene_Formation() {
+    this.initialize.apply(this, arguments);
+}
+
+Scene_Formation.prototype = Object.create(Scene_MenuBase.prototype);
+Scene_Formation.prototype.constructor = Scene_Formation;
+
+Scene_Formation.prototype.initialize = function() {
+    Scene_MenuBase.prototype.initialize.call(this);
+};
+
+Scene_Formation.prototype.create = function() {
+    Scene_MenuBase.prototype.create.call(this);
+    this.createHelpWindow();
+    this.createFormationWindow();
+};
+
+Scene_Formation.prototype.createHelpWindow = function() {
+    this._helpWindow = new Window_Help(2);
+    this._helpWindow.setText("Set each character's starting battle column. ← → to change, Z/Enter to confirm.");
+    this.addWindow(this._helpWindow);
+};
+
+Scene_Formation.prototype.createFormationWindow = function() {
+    var wy = this._helpWindow.height;
+    this._formationWindow = new Window_FormationSelect(0, wy);
+    this._formationWindow.setHandler('ok', this.onFormationOk.bind(this));
+    this._formationWindow.setHandler('cancel', this.popScene.bind(this));
+    this.addWindow(this._formationWindow);
+};
+
+Scene_Formation.prototype.onFormationOk = function() {
+    this._formationWindow.activate();
+};
+
+// ── Window_FormationSelect ────────────────────────────────────────────────
+
+function Window_FormationSelect() {
+    this.initialize.apply(this, arguments);
+}
+
+Window_FormationSelect.prototype = Object.create(Window_Selectable.prototype);
+Window_FormationSelect.prototype.constructor = Window_FormationSelect;
+
+Window_FormationSelect.prototype.initialize = function(x, y) {
+    var w = Graphics.boxWidth;
+    var h = Graphics.boxHeight - y;
+    Window_Selectable.prototype.initialize.call(this, x, y, w, h);
+    this.refresh();
+    this.select(0);
+    this.activate();
+};
+
+Window_FormationSelect.prototype.maxItems = function() {
+    return $gameParty.members().length;
+};
+
+Window_FormationSelect.prototype.itemHeight = function() {
+    return 72;
+};
+
+Window_FormationSelect.prototype.drawItem = function(index) {
+    var actor = $gameParty.members()[index];
+    if (!actor) return;
+
+    var rect = this.itemRect(index);
+    var col = actor.battlePosition ? actor.battlePosition() : 1;
+
+    // Draw actor face
+    this.drawFace(actor.faceName(), actor.faceIndex(), rect.x + 4, rect.y + 4, 64, 64);
+
+    // Name
+    this.contents.fontSize = 18;
+    this.drawText(actor.name(), rect.x + 80, rect.y + 8, 160, 'left');
+
+    // Column selector: [◄] Back [■□□□] Van [►]
+    var colNames = ['Back', 'Mid-Back', 'Mid-Front', 'Vanguard'];
+    var barX = rect.x + 250;
+    var barY = rect.y + 22;
+
+    // Draw 4 pip boxes
+    for (var c = 0; c < 4; c++) {
+        var px = barX + c * 40;
+        if (c === col) {
+            // Active column: filled box with label
+            this.contents.fillRect(px, barY, 34, 28, 'rgba(255,200,50,0.85)');
+            this.contents.textColor = '#000000';
+        } else {
+            this.contents.fillRect(px, barY, 34, 28, 'rgba(80,80,100,0.6)');
+            this.contents.textColor = 'rgba(180,180,200,0.8)';
+        }
+        this.contents.fontSize = 11;
+        this.drawText(TDarn.COL_LABELS[c], px, barY + 7, 34, 'center');
+    }
+
+    // ◄ ► arrows
+    this.contents.textColor = 'rgba(255,255,180,0.9)';
+    this.contents.fontSize = 20;
+    this.drawText('◄', barX - 28, barY + 2, 24, 'center');
+    this.drawText('►', barX + 170, barY + 2, 24, 'center');
+
+    // Column description
+    this.contents.fontSize = 13;
+    this.contents.textColor = 'rgba(200,220,255,0.75)';
+    this.drawText(colNames[col], rect.x + 80, rect.y + 44, 200, 'left');
+};
+
+// Handle left/right to change column
+Window_FormationSelect.prototype.processCursorMove = function() {
+    if (this.isCursorMovable()) {
+        var index = this.index();
+        if (Input.isRepeated('right')) {
+            this.changeColumn(index, 1);
+        } else if (Input.isRepeated('left')) {
+            this.changeColumn(index, -1);
+        }
+    }
+    Window_Selectable.prototype.processCursorMove.call(this);
+};
+
+Window_FormationSelect.prototype.changeColumn = function(index, delta) {
+    var actor = $gameParty.members()[index];
+    if (!actor) return;
+    var cur = actor.battlePosition ? actor.battlePosition() : 1;
+    var next = Math.max(0, Math.min(3, cur + delta));
+    if (next !== cur) {
+        actor._battleColumn = next;
+        SoundManager.playCursor();
+        this.redrawItem(index);
     }
 };
 
@@ -741,7 +1308,7 @@ Spriteset_Battle.prototype.updateActorPositions = function() {
 //=============================================================================
 
 Game_Actor.prototype.moveForward = function() {
-    const currentPos = this.battlePosition();
+    var currentPos = this.battlePosition();
     if (currentPos < 3) {
         this.setBattlePosition(currentPos + 1);
         return true;
@@ -750,7 +1317,7 @@ Game_Actor.prototype.moveForward = function() {
 };
 
 Game_Actor.prototype.moveBackward = function() {
-    const currentPos = this.battlePosition();
+    var currentPos = this.battlePosition();
     if (currentPos > 0) {
         this.setBattlePosition(currentPos - 1);
         return true;
@@ -782,14 +1349,17 @@ Window_MoveCommand.prototype.windowWidth = function() {
 };
 
 Window_MoveCommand.prototype.makeCommandList = function() {
-    this.addCommand('Forward', 'forward');
-    this.addCommand('Back', 'back');
-    this.addCommand('Cancel', 'cancel');
+    var canForward = !this._actor || this._actor.battlePosition() < 3;
+    var canBack    = !this._actor || this._actor.battlePosition() > 0;
+    this.addCommand('Forward', 'forward', canForward);
+    this.addCommand('Back',    'back',    canBack);
+    this.addCommand('Cancel',  'cancel',  true);
 };
 
 Window_MoveCommand.prototype.setActor = function(actor) {
     this._actor = actor;
     this._moveChoice = null;
+    this.refresh();
 };
 
 Window_MoveCommand.prototype.processOk = function() {
@@ -837,6 +1407,10 @@ Scene_Battle.prototype.createAllWindows = function() {
     for (let i = 1; i <= 5; i++) {
         this._spellLevelWindow.setHandler('level' + i, this.onSpellLevelSelect.bind(this, i));
     }
+
+    // Dice roll display overlay — rendered above all windows via addChild
+    this._diceRollWindow = new Window_DiceRoll();
+    this.addChild(this._diceRollWindow);
 };
 
 Scene_Battle.prototype.isAnyInputWindowActive = function() {
@@ -877,6 +1451,12 @@ Scene_Battle.prototype.onMove = function() {
     this._moveWindow.show();
     this._moveWindow.activate();
     this._moveWindow.select(0);
+
+    // Start walk-in-place cycle immediately when Move is selected
+    var moveSprite = this.getActorSprite(actor);
+    if (moveSprite && moveSprite.startMotion) {
+        moveSprite.startMotion('walk', true);
+    }
     
     console.log('Move window shown and active');
 };
@@ -945,23 +1525,16 @@ Scene_Battle.prototype.completeMove = function(actor) {
     if (actor) {
         var dir = actor._moveDirection;
 
-        if (dir === 'forward') {
-            actor.moveForward();
-            console.log(actor.name(), 'logical position ->', actor.battlePosition());
-        } else if (dir === 'back') {
-            actor.moveBackward();
-            console.log(actor.name(), 'logical position ->', actor.battlePosition());
-        }
-
+        // Store direction for execution-phase animation.
+        // Do NOT call moveForward/moveBackward here — the logical position
+        // change and sprite slide both happen in playMoveAnimation on the
+        // actor's turn, so the slide starts from the correct current position.
         actor._pendingMoveDir = dir;
         actor._moveDirection = null;
         actor._moveModifier = 0;
         actor._moveAction = false;
 
-        var sprite = this.getActorSprite(actor);
-        if (sprite && sprite.startMotion) {
-            sprite.startMotion('walk', true);
-        }
+        // Walk cycle started in onMove already; keep it going.
 
         if (actor.inputtingAction && actor.inputtingAction()) {
             actor.inputtingAction().setGuard();
@@ -990,12 +1563,27 @@ Scene_Battle.prototype.playMoveAnimation = function(actor) {
     var dir = actor._pendingMoveDir;
     actor._pendingMoveDir = null;
 
-    var SLIDE_PX = 100;
     var DURATION = 20;
-    var offsetX = (dir === 'forward') ? -SLIDE_PX : SLIDE_PX;
     var spriteset = this._spriteset;
 
+    // Compute the destination column and X BEFORE moving the actor logically.
+    // The actor's _battleColumn still reflects their PRE-move position here.
+    var currentCol = actor.battlePosition();
+    var destCol = currentCol;
+    if (dir === 'forward' && currentCol < 3) destCol = currentCol + 1;
+    else if (dir === 'back' && currentCol > 0) destCol = currentCol - 1;
+
+    var startX = sprite ? sprite._homeX : TDarn.actorColX(currentCol);
+    var destX   = TDarn.actorColX(destCol);
+
     var finish = function() {
+        // NOW apply the logical position change — animation is complete.
+        if (dir === 'forward') {
+            actor.moveForward();
+        } else if (dir === 'back') {
+            actor.moveBackward();
+        }
+        // updateActorPositions will snap _homeX to the correct column X.
         if (spriteset) spriteset.updateActorPositions();
         if (sprite && sprite.setDirection) sprite.setDirection(4);
         if (sprite && sprite.startMotion) sprite.startMotion('wait', true);
@@ -1003,14 +1591,15 @@ Scene_Battle.prototype.playMoveAnimation = function(actor) {
         _BattleManager_processTurn.call(BattleManager);
     };
 
-    if (!sprite) { finish(); return; }
+    if (!sprite || destCol === currentCol) { finish(); return; }
 
+    // Walk motion should already be running from onMove; ensure it's active.
     if (sprite.setDirection) sprite.setDirection(4);
     if (sprite.startMotion) sprite.startMotion('walk', true);
 
-    var startX = sprite.x;
-    var destX = sprite.x + offsetX;
+    // Set _homeX to dest so the lerp system doesn't fight the animation.
     sprite._homeX = destX;
+    sprite._tdarnTargetX = destX;
 
     this._moveAnimTimer = 0;
     this._moveAnimDuration = DURATION;
@@ -1074,6 +1663,15 @@ BattleManager.startInput = function() {
         console.log('Initiative order:', this._actionBattlers.map(function(b) {
             return b.name() + '(' + b._initiative + ')';
         }).join(', '));
+
+        // Show initiative rolls on screen
+        var initiativeLines = ['⚂ Initiative Rolls'];
+        this._actionBattlers.forEach(function(b) {
+            var d20 = b._initiative - b.agi; // isolate the raw d20 result
+            var sign = b.agi >= 0 ? '+' : '';
+            initiativeLines.push(b.name() + ': d20(' + d20 + ') ' + sign + b.agi + ' = ' + b._initiative);
+        });
+        TDarn.showRoll(initiativeLines);
     }
 
     $gameParty.battleMembers().forEach(function(actor) {
