@@ -92,6 +92,13 @@ const HIT_LOCATIONS = {
         2: { name: 'Thorax', multiplier: 1, range: [3,8], armorType: 'torso' },
         3: { name: 'Abdomen', multiplier: 1, range: [9,14], armorType: 'torso' },
         4: { name: 'Legs/Wings', multiplier: 0.5, range: [15,20], armorType: 'arms' }
+    },
+    WINGED_HUMANOID: {
+        1: { name: 'Head', multiplier: 2, range: [1,2], armorType: 'head' },
+        2: { name: 'Torso', multiplier: 1, range: [3,10], armorType: 'torso' },
+        3: { name: 'Arms', multiplier: 0.5, range: [11,15], armorType: 'arms' },
+        4: { name: 'Legs', multiplier: 0.5, range: [16,18], armorType: 'legs' },
+        5: { name: 'Wings', multiplier: 0.5, range: [19,20], armorType: 'arms' } // TENTATIVE: Wings can be hit as a separate location but use arms armor
     }
 };
 
@@ -139,7 +146,7 @@ var getDamageDice = function(weapon) {
 };
 
 var getWeaponDamage = function(weapon) {
-    if (!weapon) return { dice: 1, sides: 4 }; // Unarmed: 1d4
+    if (!weapon) return { dice: 1, sides: 6 }; // Unarmed: 1d6
     
     const meta = weapon.meta;
     
@@ -1775,7 +1782,13 @@ TDarn.closestActorColumn = function() {
 TDarn.enemyCanAdvance = function(enemy) {
     var cur = enemy.battlePosition();
     if (cur >= 3) return false;
-    return cur < TDarn.closestActorColumn();
+    if (cur >= TDarn.closestActorColumn()) return false;
+    // Can't advance if destination column already has 4 enemies
+    var dest = cur + 1;
+    var count = $gameTroop.aliveMembers().filter(function(e) {
+        return e !== enemy && Math.round(e.battlePosition()) === dest;
+    }).length;
+    return count < 4;
 };
 
 // Evaluate movement intent for this enemy. Returns 'forward', 'back', or null.
@@ -1905,12 +1918,12 @@ Spriteset_Battle.prototype.createActors = function() {
 
 // ── Column X positions ────────────────────────────────────────────────────
 TDarn.COLUMNS = 4;
-TDarn.COL_LABELS = ['Back', 'Mid', 'Front', 'Van'];
+TDarn.COL_LABELS = ['Back', 'Mid', 'Front', 'Close'];
 
 // X centre for each actor column (right side of field, col 3 closest to centre)
 TDarn.actorColX = function(col) {
     // col 0=far right, col 3=near centre
-    // Van (col 3) pulled right to 440 so actors don't overlap with enemy van (360)
+    // Close (col 3) pulled right to 440 so actors don't overlap with enemy close (360)
     var positions = [790, 650, 530, 440];
     return positions[col] || positions[1];
 };
@@ -1918,7 +1931,7 @@ TDarn.actorColX = function(col) {
 // X centre for each enemy column (left side of field, col 3 closest to centre)
 TDarn.enemyColX = function(col) {
     // col 0=far left, col 3=near centre (mirrors actors)
-    // Van (col 3) pulled left to 376 so enemies don't overlap with actor van (440)
+    // Close (col 3) pulled left to 376 so enemies don't overlap with actor close (440)
     var positions = [26, 166, 286, 376];
     return positions[col] || positions[1];
 };
@@ -1982,7 +1995,7 @@ Spriteset_Battle.prototype.createBattlefieldGrid = function() {
         bmp.drawText(TDarn.COL_LABELS[c], actorXs[c] - 30, labelY, 60, 20, 'center');
     }
     // Enemy side labels (mirrored: col 0 on their far left = "their back")
-    var enemyLabels = ['Back', 'Mid', 'Front', 'Van'];
+    var enemyLabels = ['Back', 'Mid', 'Front', 'Close'];
     for (var c = 0; c < 4; c++) {
         bmp.textColor = 'rgba(255,180,180,0.65)';
         bmp.drawText(enemyLabels[c], enemyXs[c] - 30, labelY, 60, 20, 'center');
@@ -2234,7 +2247,7 @@ Window_FormationSelect.prototype.drawItem = function(index) {
     this.drawText(actor.name(), rect.x + 80, rect.y + 8, 160, 'left');
 
     // Column selector: [◄] Back [■□□□] Van [►]
-    var colNames = ['Back', 'Mid-Back', 'Mid-Front', 'Vanguard'];
+    var colNames = ['Back', 'Mid-Back', 'Mid-Front', 'Point Blank'];
     var barX = rect.x + 250;
     var barY = rect.y + 22;
 
@@ -2842,7 +2855,11 @@ BattleManager.processTurn = function() {
         // a physical attack against a target that's out of range. If so, force
         // a move forward instead of wasting the action on a guaranteed miss.
         var action = subject.currentAction ? subject.currentAction() : null;
-        if (action && !action.isGuard() && !action.isMagicSkill()) {
+        if (action && !action.isGuard()) {
+            var actSkillItem = action.item ? action.item() : null;
+            var actIsSpell = actSkillItem && actSkillItem.meta &&
+                             (actSkillItem.meta.spellLevel || actSkillItem.meta.spellType);
+            if (!actIsSpell) {
             var targets = action.makeTargets ? action.makeTargets() : [];
             var hasValidTarget = targets.some(function(t) {
                 return isInValidRange(subject, t);
@@ -2862,6 +2879,7 @@ BattleManager.processTurn = function() {
                 this.endAction();
                 return;
             }
+            } // end !actIsSpell
         }
     }
 
@@ -2987,18 +3005,35 @@ Scene_Battle.prototype.start = function() {
     console.log('Troop members:', $gameTroop.members().map(function(m) { return m.name(); }));
     // Load any penalties tagged on the troop, clear previous troop penalties
     TDarn.loadTroopPenalties();
-    // Reset each actor's live battle column to their formation default
+    // Reset each actor's live battle column and all per-battle flags
     $gameParty.members().forEach(function(actor) {
         actor.resetBattleColumn();
+        actor._moveModifier      = 0;
+        actor._pendingMoveDir    = null;
+        actor._moveDirection     = null;
+        actor._moveAction        = false;
+        actor._autoMovedThisTurn = false;
+        actor._tdarnAutoMoved    = false;
         console.log('[FORMATION] ' + actor.name() + ' reset to default column ' + actor.defaultBattleColumn());
     });
     // Reset each enemy's live column and AI flags
     $gameTroop.members().forEach(function(enemy) {
         enemy.resetBattleColumn();
+        enemy._moveModifier   = 0;
+        enemy._pendingMoveDir = null;
+        enemy._aiMoveChecked  = false;
+        enemy._aiMovedBackHP  = false;
+        enemy._aiMovedFwdCrit = false;
         console.log('[FORMATION] ' + enemy.name() + ' reset to default column ' + enemy.battlePosition());
     });
     BattleManager._lastCritEnemy = null;
     _Scene_Battle_start.call(this);
+    // Snap sprites to reset columns — must happen after spriteset is created
+    var ss = this._spriteset;
+    if (ss) {
+        if (ss.updateActorPositions) ss.updateActorPositions();
+        if (ss.updateEnemyPositions) ss.updateEnemyPositions();
+    }
 };
 
 BattleManager.startInput = function() {
@@ -3727,7 +3762,7 @@ Scene_TDarnSkills.prototype.create = function() {
 
 Scene_TDarnSkills.prototype.createHelpWindow = function() {
     this._helpWindow = new Window_Help(2);
-    this._helpWindow.setText("Choose a character, then a category, then a skill to spend SP.");
+    this._helpWindow.setText("Choose a character, then a category, then a skill to view gained SP.");
     this.addWindow(this._helpWindow);
 };
 
